@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Expo
+.expo/
+.expo-shared/
+
+# Environment files — never commit keys
+.env
+.env.*
+!.env.example
+
+# OS/editor files
+.DS_Store
+*.swp
