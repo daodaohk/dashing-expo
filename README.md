@@ -11,7 +11,7 @@ Dashing is an adult-only, style-first outfit-sharing MVP. This repository contai
 
    ```bash
    EXPO_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-   EXPO_PUBLIC_SUPABASE_ANON_KEY=your-public-anon-key
+EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your_publishable_key
    ```
 
 5. Run `npm run start`, then open the app using Expo Go, an Android emulator, or an iOS simulator.
@@ -21,7 +21,7 @@ The UI intentionally uses local mock data until the database migration is applie
 
 ## Supabase security contract
 
-- The Expo client reads only `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_ANON_KEY` in `src/config/supabase.ts`.
+- The Expo client reads only `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY` in `src/config/supabase.ts`.
 - Never put a Supabase service-role key, database password, admin token, or other privileged secret in this app, `.env.example`, source control, or an Expo build configuration.
 - The client 18+ checkbox is an experience gate only. Supabase must enforce adult eligibility from private date-of-birth data on every protected path.
 - Published-post visibility must enforce each post’s server-calculated `max_viewer_age`; client filtering is not a security boundary.
@@ -56,3 +56,7 @@ Do not run `git push --force`. If authentication or remote history is uncertain,
 ## Scope boundaries
 
 Dashing does not include direct messages, follows/follower counts, under-18 access, Stripe/payment flows, or third-party email SDKs. Ratings always refer to outfit styling—not a person’s body, attractiveness, age, ethnicity, or identity.
+
+## Note
+
+never commit .env files, and never put a Supabase database password, secret key, or service_role key in the Expo app.
