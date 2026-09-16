@@ -1,0 +1,13 @@
+-- Dashing backend foundation — corrected profile_cards view security
+--
+-- Keep this statement immediately after the existing CREATE [OR REPLACE] VIEW
+-- public.profile_cards statement in the backend-foundation migration. It does
+-- not recreate the view, so the established view query, grants, dependencies,
+-- and application data remain unchanged.
+--
+-- For a new definition, the equivalent declaration is:
+--   CREATE VIEW public.profile_cards WITH (security_invoker = true) AS ...;
+--
+-- PostgreSQL 15+ / Supabase: make the view evaluate underlying table access
+-- as the querying role so the tables' RLS policies apply.
+ALTER VIEW public.profile_cards SET (security_invoker = true);
