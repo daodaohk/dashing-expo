@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Dashing",
+    "slug": "dashing",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "scheme": "dashing",
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Dashing uses your selected photos to create outfit posts."
+        }
+      ],
+      "expo-status-bar"
+    ],
+    "android": {
+      "package": "com.dashing.app"
+    },
+    "ios": {
+      "bundleIdentifier": "com.dashing.app"
+    }
+  }
+}
