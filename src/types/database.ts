@@ -10,6 +10,9 @@ export interface ProfileRow {
   display_name: string | null;
   avatar_url: string | null;
   bio: string | null;
+  date_of_birth?: string;
+  country?: string | null;
+  city?: string | null;
   created_at: string;
 }
 

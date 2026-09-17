@@ -1,10 +1,13 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Alert, Image, Modal, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { Brand, Button, Eyebrow, Field, Mark } from './src/components';
 import { comments as initialComments, posts as initialPosts } from './src/data/mock';
 import { colors, spacing, type } from './src/theme';
 import { Comment, Post, Tab } from './src/types';
+import type { ProfileRow } from './src/types/database';
+import { completeOnboarding, createAccount, getMyProfile, getSession, signInWithPassword, signOut } from './src/auth/dashing-auth';
+import { supabase } from './src/config/supabase';
 
 const tabs: Array<{ id: Tab; label: string; icon: string }> = [
   { id: 'feed', label: 'Discover', icon: '⌁' }, { id: 'compose', label: 'Post', icon: '+' },
@@ -12,14 +15,33 @@ const tabs: Array<{ id: Tab; label: string; icon: string }> = [
 ];
 
 export default function App() {
-  const [adultConfirmed, setAdultConfirmed] = useState(false);
-  const [hasEntered, setHasEntered] = useState(false);
+  const [sessionReady, setSessionReady] = useState(false);
+  const [profile, setProfile] = useState<ProfileRow | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>('feed');
   const [selectedPost, setSelectedPost] = useState<Post | null>(null);
   const [posts, setPosts] = useState(initialPosts);
   const [bookmarkedIds, setBookmarkedIds] = useState(() => new Set(initialPosts.filter((post) => post.isBookmarked).map((post) => post.id)));
 
-  if (!hasEntered) return <AgeGate adultConfirmed={adultConfirmed} onConfirm={() => setAdultConfirmed((value) => !value)} onEnter={() => setHasEntered(true)} />;
+  useEffect(() => {
+    let active = true;
+    const restore = async () => {
+      try {
+        const session = await getSession();
+        const nextProfile = session ? await getMyProfile() : null;
+        if (active) setProfile(nextProfile);
+      } catch (error) {
+        if (active) Alert.alert('Could not restore your session', error instanceof Error ? error.message : 'Please try again.');
+      } finally {
+        if (active) setSessionReady(true);
+      }
+    };
+    void restore();
+    const { data: listener } = supabase.auth.onAuthStateChange(() => { void restore(); });
+    return () => { active = false; listener.subscription.unsubscribe(); };
+  }, []);
+
+  if (!sessionReady) return <LoadingScreen />;
+  if (!profile) return <AccountFlow onProfileComplete={setProfile} />;
 
   const toggleBookmark = (postId: string) => setBookmarkedIds((current) => {
     const next = new Set(current); next.has(postId) ? next.delete(postId) : next.add(postId); return next;
@@ -30,21 +52,28 @@ export default function App() {
       {activeTab === 'compose' && <Composer onPublished={addPost} />}
       {activeTab === 'saved' && <Saved posts={posts.filter((post) => bookmarkedIds.has(post.id))} onOpen={setSelectedPost} />}
       {activeTab === 'rankings' && <Rankings posts={posts} onOpen={setSelectedPost} />}
-      {activeTab === 'profile' && <Profile posts={posts} onOpen={setSelectedPost} />}
+      {activeTab === 'profile' && <Profile posts={posts} onOpen={setSelectedPost} profile={profile} onSignOut={() => { void signOut().catch((error: unknown) => Alert.alert('Could not sign out', error instanceof Error ? error.message : 'Please try again.')); }} />}
     </>
   );
   return <SafeAreaView style={styles.app}><View style={styles.screen}>{screen}</View>{!selectedPost && <Nav active={activeTab} onChange={setActiveTab} />}</SafeAreaView>;
 }
 
-function AgeGate({ adultConfirmed, onConfirm, onEnter }: { adultConfirmed: boolean; onConfirm: () => void; onEnter: () => void }) {
-  const [dob, setDob] = useState('');
-  return <SafeAreaView style={styles.app}><ScrollView contentContainerStyle={styles.gate}><View style={styles.gateMark}><Mark /></View><Brand />
-    <View style={styles.hero}><Eyebrow>Style safer, together</Eyebrow><Text style={styles.heroTitle}>Outfits bring us{`\n`}<Text style={styles.pink}>together.</Text></Text><Text style={styles.copy}>A global outfit-sharing community for adults who love style.</Text></View>
-    <View style={styles.gateCard}><Text style={styles.cardTitle}>This is an 18+ space.</Text><Text style={styles.muted}>Enter your birth date and confirm you’re an adult to continue. The server verifies eligibility before community access.</Text><Field value={dob} onChangeText={setDob} placeholder="YYYY-MM-DD" />
-      <Pressable onPress={onConfirm} style={styles.checkRow}><View style={[styles.checkbox, adultConfirmed && styles.checkboxOn]}>{adultConfirmed && <Text style={styles.checkText}>✓</Text>}</View><Text style={styles.checkCopy}>I confirm I am 18 or older.</Text></Pressable>
-      <Button label="Enter Dashing" disabled={!adultConfirmed || dob.length < 10} onPress={onEnter} />
-    </View><Text style={styles.legal}>By continuing, you agree to the Terms and Community Rules.</Text></ScrollView></SafeAreaView>;
+function LoadingScreen() { return <SafeAreaView style={styles.app}><View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing.md }}><Brand /><Text style={styles.muted}>Restoring your Dashing session…</Text></View></SafeAreaView>; }
+
+function AccountFlow({ onProfileComplete }: { onProfileComplete: (profile: ProfileRow) => void }) {
+  const [mode, setMode] = useState<'welcome' | 'sign-in' | 'create' | 'complete'>('welcome');
+  const [email, setEmail] = useState(''); const [password, setPassword] = useState(''); const [displayName, setDisplayName] = useState(''); const [username, setUsername] = useState(''); const [dateOfBirth, setDateOfBirth] = useState(''); const [country, setCountry] = useState(''); const [city, setCity] = useState(''); const [busy, setBusy] = useState(false);
+  const run = async (action: () => Promise<void>) => { setBusy(true); try { await action(); } catch (error) { Alert.alert('Account update failed', error instanceof Error ? error.message : 'Please try again.'); } finally { setBusy(false); } };
+  const submitSignIn = () => { if (!email || !password) return Alert.alert('Add your details', 'Enter your email address and password.'); void run(async () => { await signInWithPassword(email, password); const profile = await getMyProfile(); if (profile) onProfileComplete(profile); else setMode('complete'); }); };
+  const submitCreate = () => { if (!email || password.length < 6) return Alert.alert('Check your details', 'Use an email address and a password with at least 6 characters.'); void run(async () => { const session = await createAccount(email, password); if (session) setMode('complete'); else Alert.alert('Check your email', 'Confirm your email, then sign in to finish your profile.'); }); };
+  const submitProfile = () => { if (!displayName || !username || !dateOfBirth || !country || !city) return Alert.alert('Complete your profile', 'Profile name, username, date of birth, country, and city are required.'); if (!isAdult(dateOfBirth)) return Alert.alert('Dashing is for adults only', 'You must be 18 or older to join. Please return when you are eligible.'); void run(async () => onProfileComplete(await completeOnboarding({ displayName, username, dateOfBirth, country, city }))); };
+  if (mode === 'welcome') return <SafeAreaView style={styles.app}><ScrollView contentContainerStyle={styles.gate}><View style={styles.gateMark}><Mark /></View><Brand /><View style={styles.hero}><Eyebrow>Style safer, together</Eyebrow><Text style={styles.heroTitle}>Outfits bring us{`\n`}<Text style={styles.pink}>together.</Text></Text><Text style={styles.copy}>A global outfit-sharing community for adults who love style.</Text></View><View style={styles.gateCard}><Text style={styles.cardTitle}>Welcome to Dashing</Text><Text style={styles.muted}>A thoughtful 18+ space for sharing personal style.</Text><Button label="Create account" onPress={() => setMode('create')} /><Button label="Sign in" secondary onPress={() => setMode('sign-in')} /></View><Text style={styles.legal}>Dashing is only available to adults aged 18 or over.</Text></ScrollView></SafeAreaView>;
+  const creating = mode === 'create';
+  if (mode === 'complete') return <SafeAreaView style={styles.app}><ScrollView contentContainerStyle={styles.gate}><Brand /><View style={styles.hero}><Eyebrow>One last step</Eyebrow><Text style={styles.heroTitle}>Make it{`\n`}<Text style={styles.pink}>yours.</Text></Text><Text style={styles.copy}>These details make your profile complete. Your date of birth, country, and city stay private.</Text></View><View style={styles.gateCard}><Text style={styles.label}>PROFILE NAME</Text><Field value={displayName} onChangeText={setDisplayName} placeholder="Your name" /><Text style={styles.label}>USERNAME</Text><Field value={username} onChangeText={setUsername} placeholder="stylebyyou" /><Text style={styles.label}>DATE OF BIRTH</Text><Field value={dateOfBirth} onChangeText={setDateOfBirth} placeholder="YYYY-MM-DD" /><Text style={styles.label}>COUNTRY</Text><Field value={country} onChangeText={setCountry} placeholder="Country" /><Text style={styles.label}>CITY</Text><Field value={city} onChangeText={setCity} placeholder="City" /><Text style={styles.muted}>You must be 18+ to continue. Supabase verifies eligibility before granting access.</Text><Button label={busy ? 'Saving…' : 'Complete profile'} disabled={busy} onPress={submitProfile} /></View></ScrollView></SafeAreaView>;
+  return <SafeAreaView style={styles.app}><ScrollView contentContainerStyle={styles.gate}><Brand /><View style={styles.hero}><Eyebrow>{creating ? 'Join the community' : 'Welcome back'}</Eyebrow><Text style={styles.heroTitle}>{creating ? 'Start your{`\n`}' : 'Your style,{`\n`}'}<Text style={styles.pink}>{creating ? 'style story.' : 'still yours.'}</Text></Text></View><View style={styles.gateCard}><Text style={styles.cardTitle}>{creating ? 'Create account' : 'Sign in'}</Text><Field value={email} onChangeText={setEmail} placeholder="Email address" /><Field value={password} onChangeText={setPassword} placeholder="Password" secureTextEntry /><Button label={busy ? 'Please wait…' : creating ? 'Create account' : 'Sign in'} disabled={busy} onPress={creating ? submitCreate : submitSignIn} /><Button label={creating ? 'I already have an account' : 'Create an account'} secondary onPress={() => setMode(creating ? 'sign-in' : 'create')} /><Pressable onPress={() => setMode('welcome')}><Text style={styles.back}>← Back</Text></Pressable></View></ScrollView></SafeAreaView>;
 }
+
+function isAdult(value: string) { const birth = new Date(`${value}T00:00:00`); if (Number.isNaN(birth.getTime()) || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false; const today = new Date(); let age = today.getFullYear() - birth.getFullYear(); const month = today.getMonth() - birth.getMonth(); if (month < 0 || (month === 0 && today.getDate() < birth.getDate())) age -= 1; return age >= 18; }
 
 function Feed({ posts, bookmarkedIds, onBookmark, onOpen }: { posts: Post[]; bookmarkedIds: Set<string>; onBookmark: (id: string) => void; onOpen: (post: Post) => void }) {
   return <ScrollView contentContainerStyle={styles.scroll}><View style={styles.topbar}><Brand /><Pressable><Text style={styles.profileDot}>◉</Text></Pressable></View><Eyebrow>For you / worldwide</Eyebrow><Text style={styles.pageTitle}>Styled to be{`\n`}<Text style={styles.pink}>shared.</Text></Text>
@@ -75,7 +104,7 @@ function Saved({ posts, onOpen }: { posts: Post[]; onOpen: (post: Post) => void 
 
 function Rankings({ posts, onOpen }: { posts: Post[]; onOpen: (post: Post) => void }) { const ranked = useMemo(() => [...posts].sort((a, b) => b.ratingAverage - a.ratingAverage), [posts]); return <ScrollView contentContainerStyle={styles.scroll}><Brand /><Eyebrow>Celebrating style</Eyebrow><Text style={styles.pageTitle}>The style{`\n`}<Text style={styles.pink}>standouts.</Text></Text><View style={styles.chips}><Chip label="Global" active /><Chip label="Streetwear" /><Chip label="Weekly" active /></View><View style={styles.winner}><Text style={styles.winnerNumber}>01</Text><Image source={{ uri: ranked[0].imageUrls[0] }} style={styles.winnerImage} /><Text style={styles.winnerTitle}>Outfit of the week</Text><Text style={styles.muted}>{ranked[0].caption}</Text></View>{ranked.map((post, index) => <Pressable onPress={() => onOpen(post)} key={post.id} style={styles.rankRow}><Text style={styles.rankNumber}>{String(index + 1).padStart(2, '0')}</Text><Image source={{ uri: post.imageUrls[0] }} style={styles.rankImage} /><View style={styles.flex}><Text style={styles.author}>{post.author}</Text><Text style={styles.location}>{post.tags.join(' · ')}</Text></View><Text style={styles.rating}>{post.ratingAverage.toFixed(1)} ✦</Text></Pressable>)}</ScrollView>; }
 
-function Profile({ posts, onOpen }: { posts: Post[]; onOpen: (post: Post) => void }) { return <ScrollView contentContainerStyle={styles.scroll}><View style={styles.topbar}><Brand /><Text style={styles.step}>EDIT</Text></View><View style={styles.profileHead}><View style={styles.avatar}><Text style={styles.avatarText}>S</Text></View><View><Text style={styles.detailTitle}>Sean’s style</Text><Text style={styles.location}>Member · self-attested adult</Text></View></View><Text style={styles.copy}>Thoughtful layers, bold details, always moving.</Text><View style={styles.statRow}><Stat value="4.7" label="STYLE AVG" /><Stat value="12" label="LOOKS" /><Stat value="3" label="TAGS" /></View><Text style={styles.sectionTitle}>Your looks</Text><View style={styles.grid}>{posts.slice(0, 4).map((post) => <Pressable key={post.id} onPress={() => onOpen(post)} style={styles.gridItem}><Image source={{ uri: post.imageUrls[0] }} style={styles.gridImage} /></Pressable>)}</View><View style={styles.notice}><Text style={styles.noticeTitle}>Safety stays server-side</Text><Text style={styles.muted}>Profile eligibility, post visibility, and age ceilings are enforced through Supabase policies and RPCs—not this interface.</Text></View></ScrollView>; }
+function Profile({ posts, onOpen, profile, onSignOut }: { posts: Post[]; onOpen: (post: Post) => void; profile: ProfileRow; onSignOut: () => void }) { const name = profile.display_name || profile.username; return <ScrollView contentContainerStyle={styles.scroll}><View style={styles.topbar}><Brand /><Text style={styles.step}>EDIT</Text></View><View style={styles.profileHead}><View style={styles.avatar}><Text style={styles.avatarText}>{name.slice(0, 1).toUpperCase()}</Text></View><View><Text style={styles.detailTitle}>{name}’s style</Text><Text style={styles.location}>Member · verified adult</Text></View></View><Text style={styles.copy}>Thoughtful layers, bold details, always moving.</Text><View style={styles.statRow}><Stat value="4.7" label="STYLE AVG" /><Stat value="12" label="LOOKS" /><Stat value="3" label="TAGS" /></View><Text style={styles.sectionTitle}>Your looks</Text><View style={styles.grid}>{posts.slice(0, 4).map((post) => <Pressable key={post.id} onPress={() => onOpen(post)} style={styles.gridItem}><Image source={{ uri: post.imageUrls[0] }} style={styles.gridImage} /></Pressable>)}</View><View style={styles.notice}><Text style={styles.noticeTitle}>Safety stays server-side</Text><Text style={styles.muted}>Profile eligibility, post visibility, and age ceilings are enforced through Supabase policies and RPCs—not this interface.</Text></View><Button label="Sign out" secondary onPress={onSignOut} /></ScrollView>; }
 
 function Nav({ active, onChange }: { active: Tab; onChange: (tab: Tab) => void }) { return <View style={styles.nav}>{tabs.map((tab) => <Pressable key={tab.id} onPress={() => onChange(tab.id)} style={styles.navItem}><Text style={[styles.navIcon, active === tab.id && styles.navActive]}>{tab.icon}</Text><Text style={[styles.navLabel, active === tab.id && styles.navActive]}>{tab.label}</Text></Pressable>)}</View>; }
 function Chip({ label, active = false, onPress }: { label: string; active?: boolean; onPress?: () => void }) { return <Pressable onPress={onPress} style={[styles.chip, active && styles.chipActive]}><Text style={[styles.chipText, active && styles.chipTextActive]}>{label}</Text></Pressable>; }

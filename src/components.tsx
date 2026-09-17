@@ -20,8 +20,8 @@ export function Button({ label, onPress, secondary = false, disabled = false }: 
   </Pressable>;
 }
 
-export function Field({ value, onChangeText, placeholder, multiline = false }: { value: string; onChangeText: (value: string) => void; placeholder: string; multiline?: boolean }) {
-  return <TextInput value={value} onChangeText={onChangeText} placeholder={placeholder} placeholderTextColor={colors.inkMuted} multiline={multiline} style={[styles.field, multiline && styles.fieldMulti]} />;
+export function Field({ value, onChangeText, placeholder, multiline = false, secureTextEntry = false }: { value: string; onChangeText: (value: string) => void; placeholder: string; multiline?: boolean; secureTextEntry?: boolean }) {
+  return <TextInput value={value} onChangeText={onChangeText} placeholder={placeholder} placeholderTextColor={colors.inkMuted} multiline={multiline} secureTextEntry={secureTextEntry} autoCapitalize="none" style={[styles.field, multiline && styles.fieldMulti]} />;
 }
 
 const styles = StyleSheet.create({

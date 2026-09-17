@@ -1,22 +1,31 @@
 import type { Session } from '@supabase/supabase-js';
 
-import { supabase } from '../config/supabase.js';
-import type { ProfileRow } from '../types/database.js';
+import { supabase } from '../config/supabase';
+import type { ProfileRow } from '../types/database';
 
 export interface OnboardingProfile {
   username: string;
   displayName: string;
   dateOfBirth: string;
+  country: string;
+  city: string;
 }
 
-export async function sendSignInLink(email: string) {
-  const redirectTo = process.env.EXPO_PUBLIC_AUTH_REDIRECT_URL;
-  const { error } = await supabase.auth.signInWithOtp({
+export async function signInWithPassword(email: string, password: string) {
+  const { error } = await supabase.auth.signInWithPassword({
     email: email.trim().toLowerCase(),
-    options: redirectTo ? { emailRedirectTo: redirectTo } : undefined,
+    password,
   });
-
   if (error) throw error;
+}
+
+export async function createAccount(email: string, password: string) {
+  const { data, error } = await supabase.auth.signUp({
+    email: email.trim().toLowerCase(),
+    password,
+  });
+  if (error) throw error;
+  return data.session;
 }
 
 export async function getSession(): Promise<Session | null> {
@@ -38,14 +47,10 @@ export async function getMyProfile(): Promise<ProfileRow | null> {
   return data;
 }
 
-/**
- * The database trigger/RLS policy is the authority for the 18+ decision.
- * This sends the DOB to the existing profile flow but never trusts a client
- * age calculation to unlock adult content.
- */
+/** The database policy is the authority for the 18+ decision. */
 export async function completeOnboarding(input: OnboardingProfile): Promise<ProfileRow> {
   const session = await getSession();
-  if (!session) throw new Error('Sign in before completing onboarding.');
+  if (!session) throw new Error('Sign in before completing your profile.');
 
   const { data, error } = await supabase
     .from('profiles')
@@ -54,15 +59,16 @@ export async function completeOnboarding(input: OnboardingProfile): Promise<Prof
         id: session.user.id,
         username: input.username.trim().toLowerCase(),
         display_name: input.displayName.trim(),
-        // Existing migration validates/stores date_of_birth and derives eligibility.
         date_of_birth: input.dateOfBirth,
+        country: input.country.trim(),
+        city: input.city.trim(),
       } as never,
       { onConflict: 'id' },
     )
     .select('*')
     .single();
   if (error) throw error;
-  return data;
+  return data as ProfileRow;
 }
 
 export async function signOut() {
