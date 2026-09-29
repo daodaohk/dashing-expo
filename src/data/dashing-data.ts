@@ -1,13 +1,78 @@
-import { supabase } from '../config/supabase.js';
-import type { CommentRow, LeaderboardRow, PostPhotoRow, PostRow, ProfileRow } from '../types/database.js';
-import type { CommentWithAuthor, FeedPage, FeedPost, PostDraft } from '../types/live-data.js';
+/**
+ * Dashing data layer — written against the live schema.
+ *
+ * Tables this talks to (project ozeixaolbickpauayjcu):
+ *   profiles(id, username, display_name, avatar_url, bio, date_of_birth,
+ *            is_moderator, country, city, default_max_viewer_age, ...)
+ *   posts(id, author_id, caption, media_urls, max_viewer_age, status,
+ *         moderation_note, moderated_at, moderated_by, ...)
+ *   ratings(id, post_id, user_id, score, ...)      -- score, not value
+ *   comments(id, post_id, author_id, body, is_hidden, ...)
+ *   bookmarks(user_id, post_id, created_at)
+ *   reports(id, reporter_id, post_id, comment_id, reason, details, ...)
+ *   profile_cards(id, username, display_name, avatar_url, bio, created_at)
+ *
+ * Visibility is enforced by RLS, not here. `max_viewer_age` is a ceiling:
+ * a viewer older than it cannot see the post, and the SELECT policy filters
+ * those rows out before this code ever receives them.
+ */
+
+import { supabase } from '../config/supabase';
+import type {
+  CommentRow,
+  LeaderboardEntry,
+  PostRow,
+  ProfileCardRow,
+  ReportReason,
+} from '../types/database';
 
 const PAGE_SIZE = 20;
-const POST_MEDIA_BUCKET = 'post-media';
 
-function storageUrl(path: string): string {
-  return supabase.storage.from(POST_MEDIA_BUCKET).getPublicUrl(path).data.publicUrl;
+// ---------------------------------------------------------------------------
+// Shapes the UI consumes
+// ---------------------------------------------------------------------------
+
+export interface FeedAuthor {
+  id: string;
+  username: string;
+  display_name: string | null;
+  avatar_url: string | null;
 }
+
+export interface FeedPost {
+  id: string;
+  author_id: string;
+  caption: string | null;
+  media_urls: string[];
+  max_viewer_age: number | null;
+  status: PostRow['status'];
+  created_at: string;
+  author: FeedAuthor;
+  ratingAverage: number | null;
+  ratingCount: number;
+  viewerRating: number | null;
+  isBookmarked: boolean;
+}
+
+export interface FeedPage {
+  posts: FeedPost[];
+  nextCursor: string | null;
+}
+
+export interface CommentWithAuthor extends CommentRow {
+  author: FeedAuthor;
+}
+
+export interface PostDraft {
+  caption: string;
+  mediaUrls: string[];
+  maxViewerAge: number | null;
+  status?: PostRow['status'];
+}
+
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
 
 function unique<T>(items: T[]): T[] {
   return [...new Set(items)];
@@ -20,144 +85,240 @@ async function requireUserId(): Promise<string> {
   return data.user.id;
 }
 
-async function hydratePosts(pageRows: PostRow[]): Promise<FeedPost[]> {
-  if (!pageRows.length) return [];
-  const postIds = pageRows.map((post) => post.id);
-  const authorIds = unique(pageRows.map((post) => post.author_id));
-  const [{ data: authors, error: authorsError }, { data: photos, error: photosError }, { data: ratings, error: ratingsError }] =
-    await Promise.all([
-      supabase.from('profiles').select('*').in('id', authorIds),
-      supabase.from('post_photos').select('*').in('post_id', postIds).order('position'),
-      supabase.from('post_ratings').select('post_id, value').in('post_id', postIds),
-    ]);
-  if (authorsError) throw authorsError;
-  if (photosError) throw photosError;
-  if (ratingsError) throw ratingsError;
+function toAuthor(card: ProfileCardRow): FeedAuthor {
+  return {
+    id: card.id,
+    username: card.username,
+    display_name: card.display_name,
+    avatar_url: card.avatar_url,
+  };
+}
 
-  const { data: userData } = await supabase.auth.getUser();
-  const viewerId = userData.user?.id;
-  const { data: myRatings, error: myRatingsError } = viewerId
-    ? await supabase.from('post_ratings').select('post_id, value').in('post_id', postIds).eq('user_id', viewerId)
-    : { data: [], error: null };
-  if (myRatingsError) throw myRatingsError;
-  const { data: bookmarks, error: bookmarksError } = viewerId
-    ? await supabase.from('bookmarks').select('post_id').in('post_id', postIds).eq('user_id', viewerId)
-    : { data: [], error: null };
-  if (bookmarksError) throw bookmarksError;
+/** Fetch the public profile cards for a set of ids. */
+async function loadAuthors(authorIds: string[]): Promise<Map<string, FeedAuthor>> {
+  const ids = unique(authorIds);
+  if (!ids.length) return new Map();
 
-  const authorById = new Map((authors as ProfileRow[]).map((author) => [author.id, author]));
-  const photosByPost = new Map<string, PostPhotoRow[]>();
-  for (const photo of (photos as PostPhotoRow[])) {
-    photosByPost.set(photo.post_id, [...(photosByPost.get(photo.post_id) ?? []), photo]);
+  const { data, error } = await supabase
+    .from('profile_cards')
+    .select('id, username, display_name, avatar_url, bio, created_at')
+    .in('id', ids);
+  if (error) throw error;
+
+  return new Map((data as ProfileCardRow[]).map((card) => [card.id, toAuthor(card)]));
+}
+
+/**
+ * Attach author, rating and bookmark state to raw post rows.
+ *
+ * Ratings are aggregated over the page's posts in one round trip. The SELECT
+ * policy on `ratings` scopes what comes back, so this only ever sees rows the
+ * viewer is entitled to.
+ */
+async function hydratePosts(rows: PostRow[]): Promise<FeedPost[]> {
+  if (!rows.length) return [];
+
+  const postIds = rows.map((row) => row.id);
+  const viewerId = (await supabase.auth.getUser()).data.user?.id ?? null;
+
+  const [authors, ratingsResult, myRatingsResult, bookmarksResult] = await Promise.all([
+    loadAuthors(rows.map((row) => row.author_id)),
+    supabase.from('ratings').select('post_id, score').in('post_id', postIds),
+    viewerId
+      ? supabase.from('ratings').select('post_id, score').in('post_id', postIds).eq('user_id', viewerId)
+      : Promise.resolve({ data: [], error: null }),
+    viewerId
+      ? supabase.from('bookmarks').select('post_id').in('post_id', postIds).eq('user_id', viewerId)
+      : Promise.resolve({ data: [], error: null }),
+  ]);
+
+  if (ratingsResult.error) throw ratingsResult.error;
+  if (myRatingsResult.error) throw myRatingsResult.error;
+  if (bookmarksResult.error) throw bookmarksResult.error;
+
+  const totals = new Map<string, { sum: number; count: number }>();
+  for (const row of (ratingsResult.data ?? []) as Array<{ post_id: string; score: number }>) {
+    const current = totals.get(row.post_id) ?? { sum: 0, count: 0 };
+    totals.set(row.post_id, { sum: current.sum + row.score, count: current.count + 1 });
   }
-  const ratingsByPost = new Map<string, number[]>();
-  for (const rating of (ratings ?? []) as Array<{ post_id: string; value: number }>) {
-    ratingsByPost.set(rating.post_id, [...(ratingsByPost.get(rating.post_id) ?? []), rating.value]);
-  }
-  const viewerRatingByPost = new Map((myRatings ?? []).map((rating) => [rating.post_id, rating.value]));
-  const bookmarkedPostIds = new Set((bookmarks ?? []).map((bookmark) => bookmark.post_id));
 
-  return pageRows.flatMap((post) => {
-    const author = authorById.get(post.author_id);
+  const myRatings = new Map(
+    ((myRatingsResult.data ?? []) as Array<{ post_id: string; score: number }>).map((row) => [
+      row.post_id,
+      row.score,
+    ]),
+  );
+  const bookmarked = new Set(
+    ((bookmarksResult.data ?? []) as Array<{ post_id: string }>).map((row) => row.post_id),
+  );
+
+  return rows.flatMap((row) => {
+    const author = authors.get(row.author_id);
     if (!author) return [];
-    const postRatings = ratingsByPost.get(post.id) ?? [];
-    return [{
-      ...post,
-      author,
-      photoUrls: (photosByPost.get(post.id) ?? []).map((photo) => storageUrl(photo.storage_path)),
-      ratingCount: postRatings.length,
-      ratingAverage: postRatings.length ? postRatings.reduce((total, rating) => total + rating, 0) / postRatings.length : null,
-      viewerRating: viewerRatingByPost.get(post.id) ?? null,
-      isBookmarked: bookmarkedPostIds.has(post.id),
-    }];
+    const rating = totals.get(row.id);
+    return [
+      {
+        id: row.id,
+        author_id: row.author_id,
+        caption: row.caption,
+        media_urls: row.media_urls,
+        max_viewer_age: row.max_viewer_age,
+        status: row.status,
+        created_at: row.created_at,
+        author,
+        ratingAverage: rating ? rating.sum / rating.count : null,
+        ratingCount: rating?.count ?? 0,
+        viewerRating: myRatings.get(row.id) ?? null,
+        isBookmarked: bookmarked.has(row.id),
+      },
+    ];
   });
 }
 
+// ---------------------------------------------------------------------------
+// Feed
+// ---------------------------------------------------------------------------
+
 export async function loadFeed(cursor?: string): Promise<FeedPage> {
-  const query = supabase
+  const base = supabase
     .from('posts')
     .select('*')
+    .eq('status', 'published')
     .order('created_at', { ascending: false })
     .limit(PAGE_SIZE + 1);
-  const { data: rawPosts, error: postsError } = cursor
-    ? await query.lt('created_at', cursor)
-    : await query;
-  if (postsError) throw postsError;
 
-  const rows = rawPosts as PostRow[];
+  const { data, error } = cursor ? await base.lt('created_at', cursor) : await base;
+  if (error) throw error;
+
+  const rows = (data ?? []) as PostRow[];
   const pageRows = rows.slice(0, PAGE_SIZE);
   if (!pageRows.length) return { posts: [], nextCursor: null };
-  const posts = await hydratePosts(pageRows);
 
-  const finalPost = pageRows[pageRows.length - 1];
-  return { posts, nextCursor: rows.length > PAGE_SIZE ? finalPost?.created_at ?? null : null };
+  const posts = await hydratePosts(pageRows);
+  const last = pageRows[pageRows.length - 1];
+  return {
+    posts,
+    nextCursor: rows.length > PAGE_SIZE ? last.created_at : null,
+  };
 }
+
+export async function loadPost(postId: string): Promise<FeedPost | null> {
+  const { data, error } = await supabase.from('posts').select('*').eq('id', postId).maybeSingle();
+  if (error) throw error;
+  if (!data) return null;
+  const [post] = await hydratePosts([data as PostRow]);
+  return post ?? null;
+}
+
+export async function loadMyPosts(): Promise<FeedPost[]> {
+  const userId = await requireUserId();
+  const { data, error } = await supabase
+    .from('posts')
+    .select('*')
+    .eq('author_id', userId)
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return hydratePosts((data ?? []) as PostRow[]);
+}
+
+// ---------------------------------------------------------------------------
+// Composing
+// ---------------------------------------------------------------------------
 
 export async function createPost(draft: PostDraft): Promise<PostRow> {
-  if (draft.photoUris.length < 1 || draft.photoUris.length > 5) {
+  const mediaUrls = draft.mediaUrls.filter((url) => url.trim().length > 0);
+  if (mediaUrls.length < 1 || mediaUrls.length > 5) {
     throw new Error('A post needs between one and five photos.');
   }
+
   const authorId = await requireUserId();
-  const { data: post, error: postError } = await supabase
+  const maxAge = draft.maxViewerAge;
+  if (maxAge !== null && (maxAge < 18 || maxAge > 100)) {
+    throw new Error('The viewer age limit must be between 18 and 100.');
+  }
+
+  const { data, error } = await supabase
     .from('posts')
-    .insert({ author_id: authorId, caption: draft.caption.trim() || null, visibility: draft.visibility })
+    .insert({
+      author_id: authorId,
+      caption: draft.caption.trim() || null,
+      media_urls: mediaUrls,
+      max_viewer_age: maxAge,
+      status: draft.status ?? 'published',
+    })
     .select('*')
     .single();
-  if (postError) throw postError;
-
-  const uploadedPaths: string[] = [];
-  try {
-    for (const [position, uri] of draft.photoUris.entries()) {
-      const response = await fetch(uri);
-      const file = await response.arrayBuffer();
-      const extension = uri.split('?')[0].split('.').pop()?.toLowerCase() || 'jpg';
-      const storagePath = `${authorId}/${post.id}/${position}.${extension}`;
-      const { error: uploadError } = await supabase.storage
-        .from(POST_MEDIA_BUCKET)
-        .upload(storagePath, file, { contentType: `image/${extension === 'jpg' ? 'jpeg' : extension}`, upsert: false });
-      if (uploadError) throw uploadError;
-      uploadedPaths.push(storagePath);
-    }
-    const { error: photosError } = await supabase.from('post_photos').insert(
-      uploadedPaths.map((storage_path, position) => ({ post_id: post.id, storage_path, position })),
-    );
-    if (photosError) throw photosError;
-    return post as PostRow;
-  } catch (error) {
-    await Promise.all(uploadedPaths.map((path) => supabase.storage.from(POST_MEDIA_BUCKET).remove([path])));
-    await supabase.from('posts').delete().eq('id', post.id);
-    throw error;
-  }
+  if (error) throw error;
+  return data as PostRow;
 }
 
-export async function setRating(postId: string, value: number): Promise<void> {
-  if (!Number.isInteger(value) || value < 1 || value > 5) throw new Error('Ratings must be whole numbers from 1 to 5.');
-  const userId = await requireUserId();
-  const { error } = await supabase.from('post_ratings').upsert({ post_id: postId, user_id: userId, value }, { onConflict: 'post_id,user_id' });
+export async function deleteMyPost(postId: string): Promise<void> {
+  const { error } = await supabase.from('posts').delete().eq('id', postId);
   if (error) throw error;
 }
+
+// ---------------------------------------------------------------------------
+// Ratings — one per viewer, enforced by the table's unique (post_id, user_id)
+// ---------------------------------------------------------------------------
+
+export async function setRating(postId: string, score: number): Promise<void> {
+  if (!Number.isInteger(score) || score < 1 || score > 5) {
+    throw new Error('Ratings must be whole numbers from 1 to 5.');
+  }
+  const userId = await requireUserId();
+  const { error } = await supabase
+    .from('ratings')
+    .upsert({ post_id: postId, user_id: userId, score }, { onConflict: 'post_id,user_id' });
+  if (error) throw error;
+}
+
+export async function clearMyRating(postId: string): Promise<void> {
+  const userId = await requireUserId();
+  const { error } = await supabase
+    .from('ratings')
+    .delete()
+    .eq('post_id', postId)
+    .eq('user_id', userId);
+  if (error) throw error;
+}
+
+// ---------------------------------------------------------------------------
+// Comments
+// ---------------------------------------------------------------------------
 
 export async function loadComments(postId: string): Promise<CommentWithAuthor[]> {
-  const { data: comments, error } = await supabase.from('comments').select('*').eq('post_id', postId).order('created_at');
+  const { data, error } = await supabase
+    .from('comments')
+    .select('*')
+    .eq('post_id', postId)
+    .eq('is_hidden', false)
+    .order('created_at');
   if (error) throw error;
-  const rows = comments as CommentRow[];
+
+  const rows = (data ?? []) as CommentRow[];
   if (!rows.length) return [];
-  const { data: authors, error: authorsError } = await supabase.from('profiles').select('id, username, display_name, avatar_url').in('id', unique(rows.map((row) => row.author_id)));
-  if (authorsError) throw authorsError;
-  const authorById = new Map((authors ?? []).map((author) => [author.id, author]));
-  return rows.flatMap((comment) => {
-    const author = authorById.get(comment.author_id);
-    return author ? [{ ...comment, author }] : [];
+
+  const authors = await loadAuthors(rows.map((row) => row.author_id));
+  return rows.flatMap((row) => {
+    const author = authors.get(row.author_id);
+    return author ? [{ ...row, author }] : [];
   });
 }
 
 export async function addComment(postId: string, body: string): Promise<void> {
-  const normalizedBody = body.trim();
-  if (!normalizedBody) throw new Error('Write a comment first.');
+  const trimmed = body.trim();
+  if (!trimmed) throw new Error('Write a comment first.');
+
   const authorId = await requireUserId();
-  const { error } = await supabase.from('comments').insert({ post_id: postId, author_id: authorId, body: normalizedBody });
+  const { error } = await supabase
+    .from('comments')
+    .insert({ post_id: postId, author_id: authorId, body: trimmed });
   if (error) throw error;
 }
+
+// ---------------------------------------------------------------------------
+// Bookmarks — private to the owner
+// ---------------------------------------------------------------------------
 
 export async function setBookmark(postId: string, shouldBookmark: boolean): Promise<void> {
   const userId = await requireUserId();
@@ -168,19 +329,87 @@ export async function setBookmark(postId: string, shouldBookmark: boolean): Prom
   if (error) throw error;
 }
 
-export async function loadMyBookmarks(): Promise<FeedPage> {
+export async function loadMyBookmarks(): Promise<FeedPost[]> {
   const userId = await requireUserId();
-  const { data: rows, error } = await supabase.from('bookmarks').select('post_id').eq('user_id', userId);
+  const { data: rows, error } = await supabase
+    .from('bookmarks')
+    .select('post_id')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false });
   if (error) throw error;
-  const ids = (rows ?? []).map((row) => row.post_id);
-  if (!ids.length) return { posts: [], nextCursor: null };
-  const { data: posts, error: postsError } = await supabase.from('posts').select('*').in('id', ids).order('created_at', { ascending: false });
+
+  const ids = ((rows ?? []) as Array<{ post_id: string }>).map((row) => row.post_id);
+  if (!ids.length) return [];
+
+  const { data: posts, error: postsError } = await supabase
+    .from('posts')
+    .select('*')
+    .in('id', ids)
+    .eq('status', 'published');
   if (postsError) throw postsError;
-  return { posts: await hydratePosts(posts as PostRow[]), nextCursor: null };
+
+  return hydratePosts((posts ?? []) as PostRow[]);
 }
 
-export async function loadLeaderboard(): Promise<LeaderboardRow[]> {
-  const { data, error } = await supabase.from('leaderboard').select('*').order('rank').limit(100);
+// ---------------------------------------------------------------------------
+// Leaderboard — ages filtered in the function, not here
+// ---------------------------------------------------------------------------
+
+export async function loadLeaderboard(limit = 50): Promise<LeaderboardEntry[]> {
+  const { data, error } = await supabase.rpc('get_post_leaderboard', { result_limit: limit });
   if (error) throw error;
-  return data as LeaderboardRow[];
+  return (data ?? []) as LeaderboardEntry[];
+}
+
+// ---------------------------------------------------------------------------
+// Reports — the destination for the report button
+// ---------------------------------------------------------------------------
+
+export async function fileReport(input: {
+  postId?: string;
+  commentId?: string;
+  reason: ReportReason;
+  details?: string;
+}): Promise<void> {
+  if (!input.postId && !input.commentId) {
+    throw new Error('A report needs a post or a comment.');
+  }
+
+  const reporterId = await requireUserId();
+  const { error } = await supabase.from('reports').insert({
+    reporter_id: reporterId,
+    post_id: input.postId ?? null,
+    comment_id: input.commentId ?? null,
+    reason: input.reason,
+    details: input.details?.trim() || null,
+  });
+  if (error) throw error;
+}
+
+// ---------------------------------------------------------------------------
+// Profile visibility preference
+// ---------------------------------------------------------------------------
+
+export async function loadMyVisibilityDefault(): Promise<number | null> {
+  const userId = await requireUserId();
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('default_max_viewer_age')
+    .eq('id', userId)
+    .maybeSingle();
+  if (error) throw error;
+  return data?.default_max_viewer_age ?? null;
+}
+
+export async function updateMyVisibilityDefault(maxAge: number | null): Promise<void> {
+  if (maxAge !== null && (maxAge < 18 || maxAge > 100)) {
+    throw new Error('The viewer age limit must be between 18 and 100.');
+  }
+
+  const userId = await requireUserId();
+  const { error } = await supabase
+    .from('profiles')
+    .update({ default_max_viewer_age: maxAge })
+    .eq('id', userId);
+  if (error) throw error;
 }
