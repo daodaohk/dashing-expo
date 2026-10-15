@@ -62,13 +62,13 @@ export async function completeOnboarding(input: OnboardingProfile): Promise<Prof
         date_of_birth: input.dateOfBirth,
         country: input.country.trim(),
         city: input.city.trim(),
-      } as never,
+      },
       { onConflict: 'id' },
     )
     .select('*')
     .single();
   if (error) throw error;
-  return data as ProfileRow;
+  return data;
 }
 
 export async function signOut() {

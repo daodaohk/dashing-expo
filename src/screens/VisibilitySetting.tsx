@@ -1,18 +1,22 @@
-import { useState } from 'react';
-import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { updateMyVisibilityDefault } from '../data/dashing-data';
+import { useEffect, useState } from 'react';
+import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
+import { updateMyVisibilityDefault, viewerAgeOptionsFor } from '../data/dashing-data';
 import { colors, spacing } from '../theme';
 
-const OPTIONS: Array<{ label: string; hint: string; value: number | null }> = [
-  { label: 'Everyone', hint: 'Any adult on Dashing', value: null },
-  { label: 'Under 30', hint: 'Adults aged 18 to 29', value: 30 },
-  { label: 'Under 25', hint: 'Adults aged 18 to 24', value: 25 },
-  { label: 'Under 21', hint: 'Adults aged 18 to 20', value: 21 },
-];
-
-export function VisibilitySetting({ initial }: { initial: number | null }) {
+/**
+ * Default "who can see my posts" setting. Only offers ceilings at or above
+ * the user's own age; the database enforces the same rule.
+ */
+export function VisibilitySetting({ initial, ownAge }: { initial: number | null; ownAge: number }) {
   const [value, setValue] = useState<number | null>(initial);
   const [busy, setBusy] = useState(false);
+
+  // `initial` can arrive after first render (loaded from the server).
+  useEffect(() => {
+    setValue(initial);
+  }, [initial]);
+
+  const options = viewerAgeOptionsFor(ownAge);
 
   const choose = async (next: number | null) => {
     const previous = value;
@@ -22,30 +26,28 @@ export function VisibilitySetting({ initial }: { initial: number | null }) {
       await updateMyVisibilityDefault(next);
     } catch (error) {
       setValue(previous);
-      Alert.alert(
-        'Could not save that',
-        error instanceof Error ? error.message : 'Please try again.',
-      );
+      Alert.alert('Could not save that', error instanceof Error ? error.message : 'Please try again.');
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <ScrollView contentContainerStyle={styles.scroll}>
+    <View style={styles.wrap}>
       <Text style={styles.label}>WHO CAN SEE YOUR POSTS</Text>
       <Text style={styles.muted}>
-        Sets the oldest viewer allowed on your new posts. You can override it per post.
+        Hide your new posts from people older than a limit you choose. You can change it for each post.
       </Text>
 
-      <View style={styles.group}>
-        {OPTIONS.map((option) => {
+      <View style={styles.group} accessibilityRole="radiogroup">
+        {options.map((option) => {
           const selected = option.value === value;
           return (
             <Pressable
               key={option.label}
               accessibilityRole="radio"
-              accessibilityState={{ selected }}
+              accessibilityState={{ selected, disabled: busy }}
+              accessibilityLabel={`${option.label}. ${option.hint}`}
               disabled={busy}
               onPress={() => void choose(option.value)}
               style={[styles.row, selected && styles.rowSelected]}
@@ -59,12 +61,12 @@ export function VisibilitySetting({ initial }: { initial: number | null }) {
           );
         })}
       </View>
-    </ScrollView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  scroll: { gap: spacing.md, padding: spacing.lg },
+  wrap: { gap: spacing.md },
   label: { color: colors.dashing, fontSize: 11, fontWeight: '700', letterSpacing: 2 },
   muted: { color: colors.inkMuted, fontSize: 14, lineHeight: 20 },
   group: { borderColor: colors.line, borderRadius: 16, borderWidth: 1, overflow: 'hidden' },
