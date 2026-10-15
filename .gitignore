@@ -5,3 +5,7 @@ node_modules/
 !.env.example
 .DS_Store
 npm-debug.log*
+
+# Supabase CLI local state
+supabase/.temp/
+supabase/.branches/
