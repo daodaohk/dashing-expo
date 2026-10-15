@@ -40,6 +40,7 @@ create table if not exists private.app_settings (
 insert into private.app_settings (id) values (true) on conflict (id) do nothing;
 comment on table private.app_settings is
   'Single-row app configuration. require_post_review=false auto-publishes posts submitted for review.';
+alter table private.app_settings enable row level security;
 revoke all on private.app_settings from public, anon, authenticated;
 
 create or replace function private.post_review_required()

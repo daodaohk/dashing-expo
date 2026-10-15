@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Button, Brand } from '../components';
-import { loadMyVisibilityDefault } from '../data/dashing-data';
+import { ageFromDateOfBirth, loadMyVisibilityDefault } from '../data/dashing-data';
 import { colors, spacing, type } from '../theme';
 import { Post } from '../types';
 import type { ProfileRow } from '../types/database';
@@ -45,7 +45,7 @@ export function Profile({ posts, onOpen, profile, onSignOut }: {
         </View>
         <View>
           <Text style={styles.detailTitle}>{name}’s style</Text>
-          <Text style={styles.location}>Member · verified adult</Text>
+          <Text style={styles.location}>Dashing member</Text>
         </View>
       </View>
 
@@ -75,7 +75,7 @@ export function Profile({ posts, onOpen, profile, onSignOut }: {
       </View>
 
       <Text style={styles.sectionTitle}>Privacy</Text>
-      <VisibilitySetting initial={visibilityDefault} />
+      <VisibilitySetting initial={visibilityDefault} ownAge={ageFromDateOfBirth(profile.date_of_birth)} />
 
       <Button label="Sign out" secondary onPress={onSignOut} />
     </ScrollView>

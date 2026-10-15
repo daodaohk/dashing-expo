@@ -1,58 +1,67 @@
 # Dashing Expo MVP
 
-Dashing is an adult-only, style-first outfit-sharing MVP. This repository contains a runnable Expo + TypeScript interface for the approved initial journeys: onboarding, discovery, one-to-five-photo composing, outfit-focused ratings and comments, private bookmarks, profile, and leaderboards.
+Dashing is an adult-only, style-first outfit-sharing app: onboarding, discovery, one-to-five-photo posts, outfit-focused ratings and comments, private bookmarks, profile, and leaderboards. Expo + TypeScript on the client, Supabase (Postgres, Auth, Storage) on the server.
+
+> Status: the database and data layer (`src/data/dashing-data.ts`) are live. Most screens in `App.tsx` still render mock data and are being wired to the data layer next.
 
 ## Local setup
 
-1. Install Node.js 20 LTS or newer.
-2. From this project directory, run `npm install`.
-3. Copy `.env.example` to `.env`.
-4. Set only these public variables if a Supabase project has already been provisioned:
+1. Install Node.js 22 LTS.
+2. `npm install`
+3. Copy `.env.example` to `.env` and fill in the two public values from Supabase → Project Settings → API.
+4. `npm run start`, then open the app in Expo Go, an Android emulator or an iOS simulator. After changing `.env`, restart with `npx expo start -c`.
+5. `npm run typecheck` before pushing. CI runs it on every pull request.
 
-   ```bash
-   EXPO_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-   EXPO_PUBLIC_SUPABASE_ANON_KEY=your-public-anon-key
-   ```
+The app needs a Supabase project to start; it fails fast with a clear message if `.env` is missing.
 
-5. Run `npm run start`, then open the app using Expo Go, an Android emulator, or an iOS simulator.
-6. Run `npx tsc --noEmit` before sharing changes.
+## Database
 
-The UI intentionally uses local mock data until the database migration is applied. A missing `.env` is safe for UI-only development; the app does not invent a Supabase project.
+Migrations live in `supabase/migrations/`:
 
-## Supabase security contract
+| File | What it is |
+| --- | --- |
+| `20260929170000_remote_baseline.sql` | The live schema as it stood on 2026-10-15, reconstructed from the production catalog. Replaces the original migrations (kept for reference in `supabase/migrations_archive/`). |
+| `20261015081023_post_status_in_review.sql` | Adds the `in_review` post status. |
+| `20261015090000_security_hardening.sql` | Security fixes and the age-ceiling redesign. |
 
-- The Expo client reads only `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_ANON_KEY` in `src/config/supabase.ts`.
-- Never put a Supabase service-role key, database password, admin token, or other privileged secret in this app, `.env.example`, source control, or an Expo build configuration.
-- The client 18+ checkbox is an experience gate only. Supabase must enforce adult eligibility from private date-of-birth data on every protected path.
-- Published-post visibility must enforce each post’s server-calculated `max_viewer_age`; client filtering is not a security boundary.
-- Feed and detail reads should use RLS-protected `get_feed` / `get_post` RPCs. Ratings should use `submit_outfit_rating`; the database must enforce one current rating per `(post_id, viewer_id)`.
-- Post submission must remain moderated: 1–5 trusted/ready media rows are required before a post can be submitted or published. Media processing and leaderboard refreshes require trusted server-side operations.
+Never edit an applied migration; add a new one.
 
-The original backend foundation describes the migration as `supabase/migrations/20260911180000_dashing_backend_foundation.sql`. It was not included in the available workspace, so this rebuild deliberately does not fabricate or deploy it. Restore the approved migration before replacing the mock flows with live calls.
+### Tests
 
-## Safe GitHub upload
+`supabase/tests/run_local.sh` builds a scratch database on any plain Postgres (with `supabase_stub.sql` standing in for Supabase's `auth` and `storage` schemas), applies every migration, and runs `security_tests.sql`, which signs in as several users and tries to break each rule. CI runs it on every pull request.
 
-1. Confirm `.gitignore` is present before staging files.
-2. Verify no `.env`, `.env.*`, `node_modules`, or `.expo` entries are staged: `git status --ignored`.
-3. Initialize and review locally:
+```bash
+PGHOST=localhost PGUSER=postgres supabase/tests/run_local.sh
+```
 
-   ```bash
-   git init
-   git add App.tsx app.json package.json tsconfig.json README.md .gitignore .env.example src .agent
-   git diff --cached --check
-   git commit -m "Initial Dashing Expo MVP"
-   ```
+### Types
 
-4. Add the intended remote and make a normal, non-force push only after confirming the repository URL and authenticated write access:
+`src/types/supabase.ts` is generated from the live schema; don't edit it by hand. After a schema change:
 
-   ```bash
-   git remote add origin https://github.com/daodaohk/dashing-expo.git
-   git branch -M main
-   git push -u origin main
-   ```
+```bash
+npx supabase gen types typescript --project-id ozeixaolbickpauayjcu > src/types/supabase.ts
+```
 
-Do not run `git push --force`. If authentication or remote history is uncertain, stop and preserve this folder for review. GitHub visibility does not make secrets safe: public Expo variables are suitable only for the public Supabase URL and anonymous key.
+`src/types/database.ts` gives the generated types friendly names.
+
+## Security model
+
+All rules are enforced in the database (row-level security, triggers and `SECURITY DEFINER` functions in the `private` schema). Client-side checks are only for friendlier messages.
+
+- **Keys.** The app holds only `EXPO_PUBLIC_SUPABASE_URL` and the publishable key. Never put a service-role/secret key or database password in the app, `.env.example`, source control or an Expo build.
+- **Adults only.** Every read and write requires a profile whose date of birth makes the user 18+. Date of birth can't be changed from the app; an administrator corrects it if needed.
+- **Moderation.** New posts are submitted as `in_review` and only moderators can publish, hide or remove them. Editing a live post's caption, photos or visibility sends it back to review. Authors can't undo a moderator's decision. The switch `private.app_settings.require_post_review` turns review off (posts then publish on submit).
+- **Viewer-age ceiling.** `posts.max_viewer_age` is the oldest viewer age (inclusive) that may see a post — "Under 25" is stored as 24 — and can never be below the author's own age. If the author later grows older than the ceiling, their current age applies instead.
+- **Ratings.** One per user per post (1–5). Rows are private to the rater; totals live on `posts.rating_count` / `rating_sum` and are maintained by the database.
+- **Leaderboard.** `get_post_leaderboard(result_limit, since)` ranks visible posts by a Bayesian average, filtered for each viewer.
+- **Author cards.** `get_profile_cards(ids)` returns only public profile fields; date of birth, country and city are never exposed.
+- **Media.** The `post-media` bucket is private. Uploads go to `<user id>/…`. Viewers can read media of posts they can see; authors and moderators can always read their own / all media.
+- **Signed-out access.** None.
+
+### Making someone a moderator
+
+Supabase dashboard → Table editor → `profiles` → set `is_moderator` to `true`. This can't be done from the app.
 
 ## Scope boundaries
 
-Dashing does not include direct messages, follows/follower counts, under-18 access, Stripe/payment flows, or third-party email SDKs. Ratings always refer to outfit styling—not a person’s body, attractiveness, age, ethnicity, or identity.
+Dashing does not include direct messages, follows/follower counts, under-18 access, payments, or third-party email SDKs. Ratings always refer to outfit styling — not a person's body, attractiveness, age, ethnicity or identity.
